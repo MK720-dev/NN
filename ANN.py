@@ -1,14 +1,15 @@
+﻿from turtle import forward
 from numpy import array, zeros, ones, arange, exp, dot, save, pi, linspace,\
                   matrix, ceil, mean, meshgrid, stack, mod
 from numpy.random import randn, randint, uniform, normal, seed, shuffle
 from numpy.linalg import norm
 import matplotlib.pylab as plt
 import sys
-
+import numpy as np
 from matplotlib import rc
 
 rc('font',**{'family':'sans-serif','sans-serif':['Computer Modern']})
-rc('text', usetex = True)
+rc('text', usetex = False)
 
 class GeneralNetwork:
     ''' A GeneralNetwork object contains information about network architecture.
@@ -69,6 +70,18 @@ class GeneralNetwork:
                                         neurons_per_layer[i - 1])))
             self.biases.append(normal(size=(neurons_per_layer[i], 1)))
 
+    def forward(self, x):
+        """
+        Run forward pass and return (list of activations, list of pre-activations).
+        """
+        activations, zs = [], []
+        a = x
+        for s in range(self.number_of_layers):
+            z = self.weights[s] @ a + self.biases[s]
+            a = self.activate(a, self.weights[s], self.biases[s])
+            zs.append(z)
+            activations.append(a)
+        return activations, zs
 
     def activate(self, x : array, W : array, b : array):
         '''
@@ -353,3 +366,45 @@ class Data:
         self.ytrain[0, int(number_of_data_points   / 2):] = y1
         self.ytrain[1, 0:int(number_of_data_points / 2)]  = y1
         self.ytrain[1, int(number_of_data_points   / 2):] = y2
+
+
+if __name__ == "__main__":
+
+    # Load dataset (10 data points from Higham)
+    data = Data(number_of_data_points=10, highamdata=True)
+
+    X = data.xtrain
+    Y = data.ytrain
+    # Create ANN: 2 → 5 → 2
+    net = GeneralNetwork(number_of_layers=3, neurons_per_layer=[2, 5, 2])
+
+    # Train with SGD
+    losses = net.train(data, epochs=2000)
+
+    # Plot training loss
+    plt.plot(losses)
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss")
+    plt.title("Training Loss with SGD (Higham Data)")
+    plt.show()
+
+    # Evaluate predictions
+    
+    for i in range(X.shape[1]):
+        pred, _ = net.forward(X[:, [i]])
+        print(f"Input {X[:,i]} → Pred {pred[-1].ravel()} | Target {Y[:,i]}")
+
+    xx, yy = np.meshgrid(np.linspace(0, 1, 100), np.linspace(0, 1, 100))
+    grid = np.vstack([xx.ravel(), yy.ravel()])
+
+    preds = []
+    for i in range(grid.shape[1]):
+        out, _ = net.forward(grid[:, [i]])
+        preds.append(np.argmax(out[-1]))  # predicted class (0 or 1)
+
+    preds = np.array(preds).reshape(xx.shape)
+
+    plt.contourf(xx, yy, preds, alpha=0.3, cmap=plt.cm.coolwarm)
+    plt.scatter(data.xtrain[0, :], data.xtrain[1, :], c=np.argmax(data.ytrain, axis=0), cmap=plt.cm.coolwarm, edgecolors="k")
+    plt.title("Decision Boundary Learned by ANN")
+    plt.show()
