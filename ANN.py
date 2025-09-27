@@ -7,6 +7,7 @@ import matplotlib.pylab as plt
 import sys
 import numpy as np
 from matplotlib import rc
+from optimizers import BatchGD, LineSearchGD, BFGS_Wolfe, ScipyBFGS, LineSearchSGD, MiniBatchBFGS_Wolfe
 
 rc('font',**{'family':'sans-serif','sans-serif':['Computer Modern']})
 rc('text', usetex = False)
@@ -288,7 +289,7 @@ class GeneralNetwork:
             # save figure
         plt.show()
         return
-
+    
     def cost_function(self, Data):
         '''
         Inputs      : Data (object) - contains information on all training
@@ -318,6 +319,288 @@ class GeneralNetwork:
             temp_cost[i] = norm(x.ravel() - Data.ytrain[:, i], 2)
 
         return norm(temp_cost, 2)**2
+    #--------------------------------------------------------
+    # NEW CODE: Extending the Newtwork's Base Class to
+    # handle the new full batch optimizers 
+    # (LineSearchGD, BFGS,...)
+    #--------------------------------------------------------
+
+    # ---- Helper: remember shapes for packing/unpacking ----
+    def _param_shapes(self):
+        w_shapes = [w.shape for w in self.weights]
+        b_shapes = [b.shape for b in self.biases]
+        return w_shapes, b_shapes 
+
+    #---- Helper: Flattens weights matrix and biases vector to be used for batch cost and gradient function computations ----
+    def pack_params(self):
+        flat = []
+        for w in self.weights: flat.append(w.ravel())
+        for b in self.biases: flat.append(b.ravel())
+        return np.concatenate(flat)
+
+    #---- Helper: Puts Weights and Biases Back into their original form ----
+    def unpack_params(self, theta):
+        w_shapes, b_shapes = self._param_shapes()
+        ofs = 0
+        for i, sh in enumerate(w_shapes):
+            sz = sh[0]*sh[1]
+            self.weights[i] = theta[ofs:ofs+sz].reshape(sh)
+            ofs += sz
+
+        for i, sh in enumerate(b_shapes):
+            sz = sh[0]*sh[1]
+            self.biases[i] = theta[ofs:ofs+sz].reshape(sh)
+            ofs += sz
+
+    #---- Helper: Cost as function of theta ----#
+    def cost_from_theta(self, theta, Data):
+        self.unpack_params(theta)
+        return self.cost_function(Data)
+
+    #---- Helper: Gradient wrt theta (full batch) ----#
+    def grad_from_theta(self, theta, Data):
+        self.unpack_params(theta)
+        dW = [np.zeros_like(w) for w in self.weights]
+        db = [np.zeros_like(b) for b in self.biases]
+
+        x = np.zeros((Data.xtrain.shape[0], 1))
+        y = np.zeros((Data.ytrain.shape[0],1))
+
+        N =  Data.xtrain.shape[1]
+
+        for k in range(N):
+            # sample 
+            x[:, 0], y[:,0] = Data.xtrain[:,k], Data.ytrain[:,k]
+
+            # forward 
+            acts = []
+            a = x
+            for s in range(self.number_of_layers):
+                a = self.activate(a, self.weights[s], self.biases[s])
+                acts.append(a)
+
+            # backprop
+            deltas = []
+            deltas.append(self.gradient(acts[-1]) * (acts[-1] - y))
+            for s in range(0, self.number_of_layers-1):
+                deltas.append(self.gradient(acts[-2 - s]) * (self.weights[-1 - s].T @ deltas[s]))
+
+            # grads
+            dW[0] += deltas[-1] @ x.T
+            for s in range(1, self.number_of_layers):
+                dW[s] += deltas[-(s+1)] @ acts[s-1].T
+            deltas.reverse()
+            for s in range(self.number_of_layers):
+                db[s] += deltas[s]
+
+        flats = [g.ravel() for g in dW] + [g.ravel() for g in db]
+        return np.concatenate(flats)
+
+    #---- Helper ----
+    def loss_single(self, theta, x, y):
+        """Compute loss for a single sample."""
+        self.unpack_params(theta)
+        a = x
+        for s in range(self.number_of_layers):
+            a = self.activate(a, self.weights[s], self.biases[s])
+        return 0.5 * np.linalg.norm(a - y)**2
+
+    #---- Helper ----
+    def grad_single(self, theta, x, y):
+        """Compute gradient wrt theta for a single sample (backprop)."""
+        self.unpack_params(theta)
+        acts = []
+        a = x
+        for s in range(self.number_of_layers):
+            a = self.activate(a, self.weights[s], self.biases[s])
+            acts.append(a)
+
+        deltas = [self.gradient(acts[-1]) * (acts[-1] - y)]
+        for s in range(0, self.number_of_layers-1):
+            deltas.append(self.gradient(acts[-2-s]) *
+                          (self.weights[-1-s].T @ deltas[s]))
+
+        dW = [np.zeros_like(w) for w in self.weights]
+        db = [np.zeros_like(b) for b in self.biases]
+
+        dW[0] = deltas[-1] @ x.T
+        for s in range(1, self.number_of_layers):
+            dW[s] = deltas[-(s+1)] @ acts[s-1].T
+
+        deltas.reverse()
+        for s in range(self.number_of_layers):
+            db[s] = deltas[s]
+
+        return np.concatenate([w.ravel() for w in dW] +
+                              [b.ravel() for b in db])
+
+    #---- Helper ----
+    def loss_batch(self, theta, X_batch, Y_batch):
+        self.unpack_params(theta)
+        m = X_batch.shape[1]
+        loss = 0.0
+        for i in range(m):
+            a = X_batch[:, [i]]
+            y = Y_batch[:, [i]]
+            for s in range(self.number_of_layers):
+                a = self.activate(a, self.weights[s], self.biases[s])
+            loss += 0.5 * np.linalg.norm(a - y)**2
+        return loss / m
+
+    #---- Helper ----
+    def grad_batch(self, theta, X_batch, Y_batch):
+        self.unpack_params(theta)
+        m = X_batch.shape[1]
+        dW = [np.zeros_like(w) for w in self.weights]
+        db = [np.zeros_like(b) for b in self.biases]
+
+        for i in range(m):
+            x = X_batch[:, [i]]
+            y = Y_batch[:, [i]]
+
+            # forward
+            acts = []
+            a = x
+            for s in range(self.number_of_layers):
+                a = self.activate(a, self.weights[s], self.biases[s])
+                acts.append(a)
+
+            # backprop
+            deltas = [self.gradient(acts[-1]) * (acts[-1] - y)]
+            for s in range(0, self.number_of_layers-1):
+                deltas.append(self.gradient(acts[-2-s]) *
+                              (self.weights[-1-s].T @ deltas[s]))
+
+            # accumulate grads
+            dW[0] += deltas[-1] @ x.T
+            for s in range(1, self.number_of_layers):
+                dW[s] += deltas[-(s+1)] @ acts[s-1].T
+            deltas.reverse()
+            for s in range(self.number_of_layers):
+                db[s] += deltas[s]
+
+        # average
+        dW = [dw / m for dw in dW]
+        db = [dbi / m for dbi in db]
+        return np.concatenate([w.ravel() for w in dW] +
+                              [b.ravel() for b in db])
+
+
+
+    #---- NEW Training Function: Trains Neural Network using specific optimizer ----
+    def train_with_optimizer(self, Data, optimizer, steps=1000, verbose=True):
+        theta = self.pack_params()
+        grad = self.grad_from_theta(theta, Data)
+
+        history = []
+        for t in range(steps):
+            cost = self.cost_from_theta(theta, Data)
+            history.append(cost)
+
+            if isinstance(optimizer, BatchGD):
+                theta = optimizer.step(theta, grad)
+                grad = self.grad_from_theta(theta, Data)
+            elif isinstance(optimizer, LineSearchGD):
+                theta = optimizer.step(theta, grad,
+                                       lambda th: self.cost_from_theta(th, Data),
+                                       lambda th: self.grad_from_theta(th, Data))
+                grad = self.grad_from_theta(theta, Data)
+            elif isinstance(optimizer, BFGS_Wolfe):
+                theta, grad = optimizer.step(theta, grad,
+                                            lambda th: self.cost_from_theta(th, Data),
+                                            lambda th: self.grad_from_theta(th, Data))
+            elif isinstance(optimizer, ScipyBFGS):
+                theta, grad = optimizer.step(theta, grad,
+                                            lambda th: self.cost_from_theta(th, Data),
+                                            lambda th: self.grad_from_theta(th, Data))
+            else:
+                raise ValueError("Unknown optimizer type")
+
+            if verbose and (t % max(1, steps//10) == 0):
+                print(f"Step {t}, cost={cost:.6f}")
+
+        self.unpack_params(theta)
+        return np.array(history)
+
+    #---- NEW Training Function: Trains Neural Network using specific Line Search SGD (Armijo)----
+    def train_with_linesearch_sgd(self, Data, optimizer, epochs=50, verbose=True):
+        theta = self.pack_params()
+        history = []
+
+        for ep in range(epochs):
+            indices = np.random.permutation(Data.xtrain.shape[1])
+            for k in indices:
+                x = Data.xtrain[:, [k]]
+                y = Data.ytrain[:, [k]]
+
+                grad = self.grad_single(theta, x, y)
+
+                theta = optimizer.step(
+                                        theta, grad,
+                                        lambda th, x, y: self.loss_single(th, x, y),
+                                        lambda th, x, y: self.grad_single(th, x, y),
+                                        x, y
+                                    )
+
+            cost = self.cost_from_theta(theta, Data)
+            history.append(cost)
+            if verbose:
+                print(f"Epoch {ep+1}, cost={cost:.6f}")
+
+        self.unpack_params(theta)
+        return np.array(history)
+
+    #---- NEW Training Function: Trains Neural Network using stochastic BFGS----
+    def train_with_minibatch_bfgs(self, Data, optimizer, epochs=50, verbose=True):
+        theta = self.pack_params()
+        history = []
+
+        for ep in range(epochs):
+            indices = np.random.permutation(Data.xtrain.shape[1])
+            for i in range(0, len(indices), optimizer.batch_size):
+                batch_idx = indices[i:i+optimizer.batch_size]
+                X_batch = Data.xtrain[:, batch_idx]
+                Y_batch = Data.ytrain[:, batch_idx]
+
+                grad = self.grad_batch(theta, X_batch, Y_batch)
+
+                theta, grad = optimizer.step(
+                    theta, grad,
+                    lambda th, Xb, Yb: self.loss_batch(th, Xb, Yb),
+                    lambda th, Xb, Yb: self.grad_batch(th, Xb, Yb),
+                    X_batch, Y_batch
+                )
+
+            cost = self.cost_from_theta(theta, Data)
+            history.append(cost)
+            if verbose:
+                print(f"Epoch {ep+1}, cost={cost:.6f}")
+
+        self.unpack_params(theta)
+        return np.array(history)
+
+
+    #---- Helper: New Generic Visualization function that works for any number of output classes ----
+    def plot_decision_boundary(self, Data, title="", ax=None): 
+        xx, yy = np.meshgrid(np.linspace(0, 1, 100), np.linspace(0, 1, 100))
+        grid = np.vstack([xx.ravel(), yy.ravel()])
+
+        preds = []
+        for j in range(grid.shape[1]):
+            out = self.predict(grid[:, [j]])
+            preds.append(np.argmax(out))   # class index
+        preds = np.array(preds).reshape(xx.shape)
+
+        if ax is None:
+            ax = plt.gca()
+        ax.contourf(xx, yy, preds, alpha=0.3, cmap=plt.cm.coolwarm)
+        ax.scatter(Data.xtrain[0, :], Data.xtrain[1, :],
+                   c=np.argmax(Data.ytrain, axis=0),
+                   cmap=plt.cm.coolwarm, edgecolors="k")
+        ax.set_title(title)
+
+
+        
 class Data:
     ''' Data object contains information about training data. Its initialization
         generates the training data for this particular problem
@@ -370,41 +653,94 @@ class Data:
 
 if __name__ == "__main__":
 
-    # Load dataset (10 data points from Higham)
+    # Data: Higham 10-point toy dataset
     data = Data(number_of_data_points=10, highamdata=True)
 
-    X = data.xtrain
-    Y = data.ytrain
-    # Create ANN: 2 → 5 → 2
-    net = GeneralNetwork(number_of_layers=3, neurons_per_layer=[2, 5, 2])
+    def fresh_net():
+        return GeneralNetwork(number_of_layers=3,
+                              neurons_per_layer=[2, 5, 2],
+                              activation_function="sigmoid")
+    
+    # ----------------------------
+    # 1) Original training (per-sample SGD)
+    # ----------------------------
+    net_orig = fresh_net()
+    cost_grid = net_orig.train(data, epochs=10000)
+    hist_orig = cost_grid.mean(axis=1)  # average per epoch
 
-    # Train with SGD
-    losses = net.train(data, epochs=2000)
+    # ----------------------------
+    # 2) Batch Gradient Descent
+    # ----------------------------
+    net_batch = fresh_net()
+    hist_batch = net_batch.train_with_optimizer(data, BatchGD(lr=0.1),
+                                                steps=10000, verbose=False)
 
-    # Plot training loss
-    plt.plot(losses)
-    plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss")
-    plt.title("Training Loss with SGD (Higham Data)")
+    # ----------------------------------------
+    # 3) Armijo Line Search Gradient Descent
+    # ----------------------------------------
+    net_ls = fresh_net()
+    hist_ls = net_ls.train_with_optimizer(data, LineSearchGD(),
+                                          steps=10000, verbose=False)
+    # --------------------------------
+    # 4) BFGS + Weak Wolfe Line Search
+    # --------------------------------
+    net_bfgs = fresh_net()
+    hist_bfgs = net_bfgs.train_with_optimizer(data, BFGS_Wolfe(), 
+                                              steps=5000, verbose=False)
+
+    # --------------------------------
+    # 5) Scipy's BFGS
+    # --------------------------------
+    net_scipy_bfgs = fresh_net()
+    hist_scipy_bfgs = net_scipy_bfgs.train_with_optimizer(data, ScipyBFGS(), steps=2000, verbose=False)
+
+    # --------------------------------
+    # 6) Linea Search SGD (Armijo)
+    # --------------------------------
+    """net_sgd_ls = fresh_net()
+    hist_sgd_ls = net_sgd_ls.train_with_linesearch_sgd(data, LineSearchSGD(), epochs=10000)"""
+
+    # --------------------------------
+    # 7) Stochastic BFGS
+    # --------------------------------
+    """net_sbfgs = fresh_net()
+    hist_sbfgs = net_sbfgs.train_with_minibatch_bfgs(data, MiniBatchBFGS_Wolfe(), epochs=10000)"""
+
+    # ----------------------------
+    # Plot cost comparison
+    # ----------------------------
+    plt.figure()
+    plt.plot(hist_orig, label="Original SGD (per-sample)")
+    plt.plot(hist_batch, label="BatchGD (fixed η)")
+    plt.plot(hist_ls, label="LineSearchGD (Armijo)")
+    plt.plot(hist_bfgs, label="BFGS_Wolfe")
+    plt.plot(hist_scipy_bfgs, label="Scipy_BFGS")
+    #plt.plot(hist_sgd_ls, label="SGD + Armijo Line Search")
+    #plt.plot(hist_sbfgs, label="Stochastic BFGS")
+    plt.yscale("log")
+    plt.xlabel("Step / Epoch")
+    plt.ylabel("Cost")
+    plt.title("Optimizer Comparison on Higham Data")
+    plt.legend()
     plt.show()
 
-    # Evaluate predictions
-    
-    for i in range(X.shape[1]):
-        pred, _ = net.forward(X[:, [i]])
-        print(f"Input {X[:,i]} → Pred {pred[-1].ravel()} | Target {Y[:,i]}")
+    # -------------------------------
+    # Plot classification boundaries
+    # -------------------------------
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
 
-    xx, yy = np.meshgrid(np.linspace(0, 1, 100), np.linspace(0, 1, 100))
-    grid = np.vstack([xx.ravel(), yy.ravel()])
+    nets = [
+        (net_orig, "Original SGD"),
+        (net_batch, "BatchGD"),
+        (net_ls, "LineSearchGD"),
+        (net_bfgs, "BFGS_Wolfe"),
+        (net_scipy_bfgs, "Scipy_BFGS")
+        #(net_sgd_ls, "SGD + Armijo Line Search"),
+        #(net_sbfgs, "Stochastic BFGS")
+    ]
 
-    preds = []
-    for i in range(grid.shape[1]):
-        out, _ = net.forward(grid[:, [i]])
-        preds.append(np.argmax(out[-1]))  # predicted class (0 or 1)
+    for ax, (net, title) in zip(axes.ravel(), nets):
+        net.plot_decision_boundary(data, title=title, ax=ax)
 
-    preds = np.array(preds).reshape(xx.shape)
-
-    plt.contourf(xx, yy, preds, alpha=0.3, cmap=plt.cm.coolwarm)
-    plt.scatter(data.xtrain[0, :], data.xtrain[1, :], c=np.argmax(data.ytrain, axis=0), cmap=plt.cm.coolwarm, edgecolors="k")
-    plt.title("Decision Boundary Learned by ANN")
+    plt.tight_layout()
     plt.show()
